@@ -16,13 +16,9 @@
 package es
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"io/ioutil"
-	"os"
 	"testing"
-	"text/template"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -62,7 +58,7 @@ func TestElasticsearchFactory(t *testing.T) {
 	f := NewFactory()
 	v, command := config.Viperize(f.AddFlags)
 	command.ParseFlags([]string{})
-	f.InitFromViper(v)
+	f.InitFromViper(v, zap.NewNop())
 
 	// after InitFromViper, f.primaryConfig points to a real session builder that will fail in unit tests,
 	// so we override it with a mock.
@@ -102,6 +98,22 @@ func TestElasticsearchTagsFileDoNotExist(t *testing.T) {
 	assert.NoError(t, f.Initialize(metrics.NullFactory, zap.NewNop()))
 	r, err := f.CreateSpanWriter()
 	require.Error(t, err)
+	assert.Nil(t, r)
+}
+
+func TestElasticsearchILMUsedWithoutReadWriteAliases(t *testing.T) {
+	f := NewFactory()
+	mockConf := &mockClientBuilder{}
+	mockConf.UseILM = true
+	f.primaryConfig = mockConf
+	f.archiveConfig = mockConf
+	assert.NoError(t, f.Initialize(metrics.NullFactory, zap.NewNop()))
+	w, err := f.CreateSpanWriter()
+	require.EqualError(t, err, "--es.use-ilm must always be used in conjunction with --es.use-aliases to ensure ES writers and readers refer to the single index mapping")
+	assert.Nil(t, w)
+
+	r, err := f.CreateSpanReader()
+	require.EqualError(t, err, "--es.use-ilm must always be used in conjunction with --es.use-aliases to ensure ES writers and readers refer to the single index mapping")
 	assert.Nil(t, r)
 }
 
@@ -162,49 +174,6 @@ func TestTagKeysAsFields(t *testing.T) {
 	}
 }
 
-func TestFactory_LoadMapping(t *testing.T) {
-	tests := []struct {
-		name     string
-		esPrefix string
-		useILM   bool
-	}{
-		{name: "/jaeger-span.json"},
-		{name: "/jaeger-service.json"},
-		{name: "/jaeger-span.json"},
-		{name: "/jaeger-service.json"},
-		{name: "/jaeger-span-7.json", esPrefix: "test", useILM: true},
-		{name: "/jaeger-service-7.json", esPrefix: "test", useILM: true},
-		{name: "/jaeger-dependencies.json"},
-		{name: "/jaeger-dependencies-7.json"},
-	}
-	for _, test := range tests {
-		mapping := LoadMapping(test.name)
-		writer := new(bytes.Buffer)
-		f, err := os.Open("mappings/" + test.name)
-		require.NoError(t, err)
-		b, err := ioutil.ReadAll(f)
-		require.NoError(t, err)
-		assert.Equal(t, string(b), mapping)
-		tempMapping, err := template.New("mapping").Parse(mapping)
-		require.NoError(t, err)
-		esPrefixTemplateVal := test.esPrefix
-		if esPrefixTemplateVal != "" {
-			esPrefixTemplateVal += "-"
-		}
-		values := struct {
-			NumberOfShards   int64
-			NumberOfReplicas int64
-			ESPrefix         string
-			UseILM           bool
-		}{10, 0, esPrefixTemplateVal, test.useILM}
-		err = tempMapping.Execute(writer, values)
-		require.NoError(t, err)
-		actualMapping, err := FixMapping(es.TextTemplateBuilder{}, mapping, 10, 0, test.esPrefix, test.useILM)
-		require.NoError(t, err)
-		assert.Equal(t, writer.String(), actualMapping)
-	}
-}
-
 func TestCreateTemplateError(t *testing.T) {
 	f := NewFactory()
 	f.primaryConfig = &mockClientBuilder{createTemplateError: errors.New("template-error"), Configuration: escfg.Configuration{Enabled: true, CreateIndexTemplates: true}}
@@ -248,219 +217,4 @@ func TestInitFromOptions(t *testing.T) {
 	f.InitFromOptions(o)
 	assert.Equal(t, o.GetPrimary(), f.primaryConfig)
 	assert.Equal(t, o.Get(archiveNamespace), f.archiveConfig)
-}
-
-func TestNewOptions(t *testing.T) {
-	primaryCfg := escfg.Configuration{IndexPrefix: "primary"}
-	archiveCfg := escfg.Configuration{IndexPrefix: "archive"}
-	o := NewOptionsFromConfig(primaryCfg, archiveCfg)
-	assert.Equal(t, primaryCfg, o.Primary.Configuration)
-	assert.Equal(t, primaryNamespace, o.Primary.namespace)
-	assert.Equal(t, 1, len(o.others))
-	assert.Equal(t, archiveCfg, o.others[archiveNamespace].Configuration)
-	assert.Equal(t, archiveNamespace, o.others[archiveNamespace].namespace)
-}
-
-func TestFixMapping(t *testing.T) {
-	tests := []struct {
-		name                    string
-		templateBuilderMockFunc func() *mocks.TemplateBuilder
-		err                     string
-	}{
-		{
-			name: "templateRenderSuccess",
-			templateBuilderMockFunc: func() *mocks.TemplateBuilder {
-				tb := mocks.TemplateBuilder{}
-				ta := mocks.TemplateApplier{}
-				ta.On("Execute", mock.Anything, mock.Anything).Return(nil)
-				tb.On("Parse", mock.Anything).Return(&ta, nil)
-				return &tb
-			},
-			err: "",
-		},
-		{
-			name: "templateRenderFailure",
-			templateBuilderMockFunc: func() *mocks.TemplateBuilder {
-				tb := mocks.TemplateBuilder{}
-				ta := mocks.TemplateApplier{}
-				ta.On("Execute", mock.Anything, mock.Anything).Return(errors.New("template exec error"))
-				tb.On("Parse", mock.Anything).Return(&ta, nil)
-				return &tb
-			},
-			err: "template exec error",
-		},
-		{
-			name: "templateLoadError",
-			templateBuilderMockFunc: func() *mocks.TemplateBuilder {
-				tb := mocks.TemplateBuilder{}
-				tb.On("Parse", mock.Anything).Return(nil, errors.New("template load error"))
-				return &tb
-			},
-			err: "template load error",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			_, err := FixMapping(test.templateBuilderMockFunc(), "test", 3, 5, "test", true)
-			if test.err != "" {
-				assert.EqualError(t, err, test.err)
-			} else {
-				assert.NoError(t, err)
-			}
-
-		})
-	}
-}
-
-func TestGetSpanServiceMappings(t *testing.T) {
-	type args struct {
-		shards    int64
-		replicas  int64
-		esVersion uint
-		esPrefix  string
-		useILM    bool
-	}
-	tests := []struct {
-		name                       string
-		args                       args
-		mockNewTextTemplateBuilder func() es.TemplateBuilder
-		err                        string
-	}{
-		{
-			name: "ES Version 7",
-			args: args{
-				shards:    3,
-				replicas:  3,
-				esVersion: 7,
-				esPrefix:  "test",
-				useILM:    true,
-			},
-			mockNewTextTemplateBuilder: func() es.TemplateBuilder {
-				tb := mocks.TemplateBuilder{}
-				ta := mocks.TemplateApplier{}
-				ta.On("Execute", mock.Anything, mock.Anything).Return(nil)
-				tb.On("Parse", mock.Anything).Return(&ta, nil)
-				return &tb
-			},
-			err: "",
-		},
-		{
-			name: "ES Version 7 Service Error",
-			args: args{
-				shards:    3,
-				replicas:  3,
-				esVersion: 7,
-				esPrefix:  "test",
-				useILM:    true,
-			},
-			mockNewTextTemplateBuilder: func() es.TemplateBuilder {
-				tb := mocks.TemplateBuilder{}
-				ta := mocks.TemplateApplier{}
-				ta.On("Execute", mock.Anything, mock.Anything).Return(nil).Once()
-				ta.On("Execute", mock.Anything, mock.Anything).Return(errors.New("template load error")).Once()
-				tb.On("Parse", mock.Anything).Return(&ta, nil)
-				return &tb
-			},
-			err: "template load error",
-		},
-
-		{
-			name: "ES Version < 7",
-			args: args{
-				shards:    3,
-				replicas:  3,
-				esVersion: 6,
-				esPrefix:  "test",
-				useILM:    true,
-			},
-			mockNewTextTemplateBuilder: func() es.TemplateBuilder {
-				tb := mocks.TemplateBuilder{}
-				ta := mocks.TemplateApplier{}
-				ta.On("Execute", mock.Anything, mock.Anything).Return(nil)
-				tb.On("Parse", mock.Anything).Return(&ta, nil)
-				return &tb
-			},
-			err: "",
-		},
-		{
-			name: "ES Version < 7 Service Error",
-			args: args{
-				shards:    3,
-				replicas:  3,
-				esVersion: 6,
-				esPrefix:  "test",
-				useILM:    true,
-			},
-			mockNewTextTemplateBuilder: func() es.TemplateBuilder {
-				tb := mocks.TemplateBuilder{}
-				ta := mocks.TemplateApplier{}
-				ta.On("Execute", mock.Anything, mock.Anything).Return(nil).Once()
-				ta.On("Execute", mock.Anything, mock.Anything).Return(errors.New("template load error")).Once()
-				tb.On("Parse", mock.Anything).Return(&ta, nil)
-				return &tb
-			},
-			err: "template load error",
-		},
-		{
-			name: "ES Version < 7 Span Error",
-			args: args{
-				shards:    3,
-				replicas:  3,
-				esVersion: 6,
-				esPrefix:  "test",
-				useILM:    true,
-			},
-			mockNewTextTemplateBuilder: func() es.TemplateBuilder {
-				tb := mocks.TemplateBuilder{}
-				ta := mocks.TemplateApplier{}
-				ta.On("Execute", mock.Anything, mock.Anything).Return(errors.New("template load error"))
-				tb.On("Parse", mock.Anything).Return(&ta, nil)
-				return &tb
-			},
-			err: "template load error",
-		},
-		{
-			name: "ES Version  7 Span Error",
-			args: args{
-				shards:    3,
-				replicas:  3,
-				esVersion: 7,
-				esPrefix:  "test",
-				useILM:    true,
-			},
-			mockNewTextTemplateBuilder: func() es.TemplateBuilder {
-				tb := mocks.TemplateBuilder{}
-				ta := mocks.TemplateApplier{}
-				ta.On("Execute", mock.Anything, mock.Anything).Return(errors.New("template load error")).Once()
-				tb.On("Parse", mock.Anything).Return(&ta, nil)
-				return &tb
-			},
-			err: "template load error",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			_, _, err := GetSpanServiceMappings(test.mockNewTextTemplateBuilder(), test.args.shards, test.args.replicas,
-				test.args.esVersion, test.args.esPrefix,
-				test.args.useILM)
-			if test.err != "" {
-				assert.EqualError(t, err, test.err)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
-}
-
-func TestGetDependenciesMappings(t *testing.T) {
-	tb := mocks.TemplateBuilder{}
-	ta := mocks.TemplateApplier{}
-	ta.On("Execute", mock.Anything, mock.Anything).Return(errors.New("template load error"))
-	tb.On("Parse", mock.Anything).Return(&ta, nil)
-
-	_, err := GetDependenciesMappings(&tb, 5, 5, 7)
-	assert.EqualError(t, err, "template load error")
-	_, err = GetDependenciesMappings(&tb, 5, 5, 6)
-	assert.EqualError(t, err, "template load error")
 }

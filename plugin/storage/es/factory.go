@@ -16,7 +16,6 @@
 package es
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -65,7 +64,7 @@ func (f *Factory) AddFlags(flagSet *flag.FlagSet) {
 }
 
 // InitFromViper implements plugin.Configurable
-func (f *Factory) InitFromViper(v *viper.Viper) {
+func (f *Factory) InitFromViper(v *viper.Viper, logger *zap.Logger) {
 	f.Options.InitFromViper(v)
 	f.primaryConfig = f.Options.GetPrimary()
 	f.archiveConfig = f.Options.Get(archiveNamespace)
@@ -111,7 +110,7 @@ func (f *Factory) CreateSpanWriter() (spanstore.Writer, error) {
 // CreateDependencyReader implements storage.Factory
 func (f *Factory) CreateDependencyReader() (dependencystore.Reader, error) {
 	reader := esDepStore.NewDependencyStore(f.primaryClient, f.logger, f.primaryConfig.GetIndexPrefix(),
-		f.primaryConfig.GetIndexDateLayout(), f.primaryConfig.GetMaxDocCount())
+		f.primaryConfig.GetIndexDateLayoutDependencies(), f.primaryConfig.GetMaxDocCount())
 	return reader, nil
 }
 
@@ -138,17 +137,24 @@ func createSpanReader(
 	cfg config.ClientBuilder,
 	archive bool,
 ) (spanstore.Reader, error) {
+	if cfg.GetUseILM() && !cfg.GetUseReadWriteAliases() {
+		return nil, fmt.Errorf("--es.use-ilm must always be used in conjunction with --es.use-aliases to ensure ES writers and readers refer to the single index mapping")
+	}
 	return esSpanStore.NewSpanReader(esSpanStore.SpanReaderParams{
-		Client:              client,
-		Logger:              logger,
-		MetricsFactory:      mFactory,
-		MaxDocCount:         cfg.GetMaxDocCount(),
-		MaxSpanAge:          cfg.GetMaxSpanAge(),
-		IndexPrefix:         cfg.GetIndexPrefix(),
-		IndexDateLayout:     cfg.GetIndexDateLayout(),
-		TagDotReplacement:   cfg.GetTagDotReplacement(),
-		UseReadWriteAliases: cfg.GetUseReadWriteAliases(),
-		Archive:             archive,
+		Client:                        client,
+		Logger:                        logger,
+		MetricsFactory:                mFactory,
+		MaxDocCount:                   cfg.GetMaxDocCount(),
+		MaxSpanAge:                    cfg.GetMaxSpanAge(),
+		IndexPrefix:                   cfg.GetIndexPrefix(),
+		SpanIndexDateLayout:           cfg.GetIndexDateLayoutSpans(),
+		ServiceIndexDateLayout:        cfg.GetIndexDateLayoutServices(),
+		SpanIndexRolloverFrequency:    cfg.GetIndexRolloverFrequencySpansDuration(),
+		ServiceIndexRolloverFrequency: cfg.GetIndexRolloverFrequencyServicesDuration(),
+		TagDotReplacement:             cfg.GetTagDotReplacement(),
+		UseReadWriteAliases:           cfg.GetUseReadWriteAliases(),
+		Archive:                       archive,
+		RemoteReadClusters:            cfg.GetRemoteReadClusters(),
 	}), nil
 }
 
@@ -161,26 +167,39 @@ func createSpanWriter(
 ) (spanstore.Writer, error) {
 	var tags []string
 	var err error
+	if cfg.GetUseILM() && !cfg.GetUseReadWriteAliases() {
+		return nil, fmt.Errorf("--es.use-ilm must always be used in conjunction with --es.use-aliases to ensure ES writers and readers refer to the single index mapping")
+	}
 	if tags, err = cfg.TagKeysAsFields(); err != nil {
 		logger.Error("failed to get tag keys", zap.Error(err))
 		return nil, err
 	}
 
-	spanMapping, serviceMapping, err := GetSpanServiceMappings(es.TextTemplateBuilder{}, cfg.GetNumShards(), cfg.GetNumReplicas(), client.GetVersion(), cfg.GetIndexPrefix(), cfg.GetUseILM())
+	mappingBuilder := mappings.MappingBuilder{
+		TemplateBuilder: es.TextTemplateBuilder{},
+		Shards:          cfg.GetNumShards(),
+		Replicas:        cfg.GetNumReplicas(),
+		EsVersion:       cfg.GetVersion(),
+		IndexPrefix:     cfg.GetIndexPrefix(),
+		UseILM:          cfg.GetUseILM(),
+	}
+
+	spanMapping, serviceMapping, err := mappingBuilder.GetSpanServiceMappings()
 	if err != nil {
 		return nil, err
 	}
 	writer := esSpanStore.NewSpanWriter(esSpanStore.SpanWriterParams{
-		Client:              client,
-		Logger:              logger,
-		MetricsFactory:      mFactory,
-		IndexPrefix:         cfg.GetIndexPrefix(),
-		IndexDateLayout:     cfg.GetIndexDateLayout(),
-		AllTagsAsFields:     cfg.GetAllTagsAsFields(),
-		TagKeysAsFields:     tags,
-		TagDotReplacement:   cfg.GetTagDotReplacement(),
-		Archive:             archive,
-		UseReadWriteAliases: cfg.GetUseReadWriteAliases(),
+		Client:                 client,
+		Logger:                 logger,
+		MetricsFactory:         mFactory,
+		IndexPrefix:            cfg.GetIndexPrefix(),
+		SpanIndexDateLayout:    cfg.GetIndexDateLayoutSpans(),
+		ServiceIndexDateLayout: cfg.GetIndexDateLayoutServices(),
+		AllTagsAsFields:        cfg.GetAllTagsAsFields(),
+		TagKeysAsFields:        tags,
+		TagDotReplacement:      cfg.GetTagDotReplacement(),
+		Archive:                archive,
+		UseReadWriteAliases:    cfg.GetUseReadWriteAliases(),
 	})
 	if cfg.IsCreateIndexTemplates() {
 		err := writer.CreateTemplates(spanMapping, serviceMapping, cfg.GetIndexPrefix())
@@ -189,70 +208,6 @@ func createSpanWriter(
 		}
 	}
 	return writer, nil
-}
-
-// GetSpanServiceMappings returns span and service mappings
-func GetSpanServiceMappings(tb es.TemplateBuilder, shards, replicas int64, esVersion uint, esPrefix string, useILM bool) (string, string, error) {
-	if esVersion == 7 {
-		spanMapping, err := FixMapping(tb, LoadMapping("/jaeger-span-7.json"), shards, replicas, esPrefix, useILM)
-		if err != nil {
-			return "", "", err
-		}
-		serviceMapping, err := FixMapping(tb, LoadMapping("/jaeger-service-7.json"), shards, replicas, esPrefix, useILM)
-		if err != nil {
-			return "", "", err
-		}
-		return spanMapping, serviceMapping, nil
-	}
-	spanMapping, err := FixMapping(tb, LoadMapping("/jaeger-span.json"), shards, replicas, "", false)
-	if err != nil {
-		return "", "", err
-	}
-	serviceMapping, err := FixMapping(tb, LoadMapping("/jaeger-service.json"), shards, replicas, "", false)
-	if err != nil {
-		return "", "", err
-	}
-	return spanMapping, serviceMapping, nil
-}
-
-// GetDependenciesMappings returns dependencies mappings
-func GetDependenciesMappings(tb es.TemplateBuilder, shards, replicas int64, esVersion uint) (string, error) {
-	if esVersion == 7 {
-		return FixMapping(tb, LoadMapping("/jaeger-dependencies-7.json"), shards, replicas, "", false)
-	}
-	return FixMapping(tb, LoadMapping("/jaeger-dependencies.json"), shards, replicas, "", false)
-}
-
-// LoadMapping returns index mappings from go assets as strings
-func LoadMapping(name string) string {
-	s, _ := mappings.FSString(false, name)
-	return s
-}
-
-// FixMapping parses the index mappings with given values and returns parsed template as string
-func FixMapping(tb es.TemplateBuilder, mapping string, shards, replicas int64, esPrefix string, useILM bool) (string, error) {
-
-	tmpl, err := tb.Parse(mapping)
-	if err != nil {
-		return "", err
-	}
-	writer := new(bytes.Buffer)
-
-	if esPrefix != "" {
-		esPrefix += "-"
-	}
-	values := struct {
-		NumberOfShards   int64
-		NumberOfReplicas int64
-		ESPrefix         string
-		UseILM           bool
-	}{shards, replicas, esPrefix, useILM}
-
-	if err := tmpl.Execute(writer, values); err != nil {
-		return "", err
-	}
-
-	return writer.String(), nil
 }
 
 var _ io.Closer = (*Factory)(nil)
